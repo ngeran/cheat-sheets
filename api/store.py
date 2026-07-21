@@ -2,20 +2,18 @@
 Storage backend for core-sheets.
 
 Two implementations behind one interface:
-  - FSStore:   markdown files on disk (local dev / k3s PVC).
-  - KVStore:   Vercel KV (Upstash Redis) — the only persistent option on
-               Vercel serverless, whose filesystem is ephemeral/read-only.
+  - FSStore:        markdown files on disk (local dev / k3s PVC).
+  - PostgresStore:  Neon / Vercel Postgres — the persistent store on Vercel
+                    serverless, whose filesystem is ephemeral/read-only.
 
-Selection is env-driven: if KV_REST_API_URL is set (auto-injected by Vercel
-when you create a KV store), KVStore is used; otherwise FSStore. The KV
-client is imported lazily so dev never needs upstash-redis installed.
-
-On a fresh store, seed_if_empty() copies the bundled api/seed/*.md sheets in
-so prod isn't blank on first deploy.
+Selection is env-driven: DATABASE_URL -> Postgres (Vercel), else filesystem.
+setup() is idempotent: it creates the table (Postgres) and, on an empty store,
+seeds the bundled api/seed/*.md sheets so prod isn't blank on first deploy.
 """
 
 import os
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,9 +26,13 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _iso(dt) -> str:
+    return dt.isoformat() if dt else _now_iso()
+
+
 class ReadOnlyStore(Exception):
-    """Raised when the store can't persist — e.g. a serverless read-only FS
-    before Vercel KV is provisioned. Routes translate this into a clear 503."""
+    """Raised when the store can't persist — e.g. a serverless read-only FS.
+    Routes translate this into a clear 503."""
 
 
 class Store(ABC):
@@ -53,6 +55,10 @@ class Store(ABC):
     @abstractmethod
     def is_empty(self) -> bool: ...
 
+    def setup(self) -> None:
+        """Idempotent one-time init (schema for Postgres, then seed)."""
+        self.seed_if_empty()
+
     def seed_if_empty(self) -> None:
         if not self.is_empty() or not SEED_DIR.is_dir():
             return
@@ -66,8 +72,8 @@ class FSStore(Store):
         try:
             self.root.mkdir(parents=True, exist_ok=True)
         except OSError:
-            # Read-only filesystem (serverless without KV). Reads still work
-            # via the seed fallback in _entries(); writes will fail at call time.
+            # Read-only filesystem (serverless without a DB). Reads still work
+            # via the seed fallback in _entries(); writes fail at call time.
             pass
 
     def _path(self, sheet_id: str) -> Path:
@@ -75,8 +81,7 @@ class FSStore(Store):
 
     def _entries(self) -> list[Path]:
         # Serve the data dir; fall back to the bundled seed when it's empty
-        # (e.g. a read-only serverless FS before KV is provisioned), so a fresh
-        # deploy still shows sheets instead of a blank page.
+        # (e.g. a read-only serverless FS), so a fresh deploy still shows sheets.
         files = sorted(self.root.glob("*.md"))
         if not files and SEED_DIR.is_dir():
             files = sorted(SEED_DIR.glob("*.md"))
@@ -106,7 +111,7 @@ class FSStore(Store):
         p = self._path(sheet_id)
         try:
             p.write_text(raw, encoding="utf-8")
-        except OSError as e:  # read-only filesystem (serverless without KV)
+        except OSError as e:  # read-only filesystem (serverless without a DB)
             raise ReadOnlyStore() from e
         return datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat()
 
@@ -116,7 +121,7 @@ class FSStore(Store):
             return False
         try:
             p.unlink()
-        except OSError as e:  # read-only filesystem (serverless without KV)
+        except OSError as e:  # read-only filesystem (serverless without a DB)
             raise ReadOnlyStore() from e
         return True
 
@@ -124,78 +129,74 @@ class FSStore(Store):
         return len(self._entries()) == 0
 
 
-def _val(resp):
-    """upstash-redis wraps responses; newer versions return the value directly."""
-    return resp.data if hasattr(resp, "data") else resp
+class PostgresStore(Store):
+    SCHEMA = (
+        "CREATE TABLE IF NOT EXISTS sheets ("
+        "  id TEXT PRIMARY KEY,"
+        "  body TEXT NOT NULL,"
+        "  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+        ")"
+    )
 
-
-class KVStore(Store):
-    INDEX = "sheets:index"
-
-    def __init__(self):
-        from upstash_redis import Redis  # lazy: dev (FSStore) never imports this
-
-        self.r = Redis(
-            url=os.environ["KV_REST_API_URL"],
-            token=os.environ["KV_REST_API_TOKEN"],
-        )
+    def setup(self) -> None:
+        self._ensure_schema()
+        self.seed_if_empty()
 
     @staticmethod
-    def _k(sheet_id: str) -> str:
-        return f"sheet:{sheet_id}"
+    @contextmanager
+    def _cursor():
+        import psycopg  # lazy: dev (FSStore) never needs psycopg installed
 
-    @staticmethod
-    def _m(sheet_id: str) -> str:
-        return f"mtime:{sheet_id}"
+        conn = psycopg.connect(os.environ["DATABASE_URL"], autocommit=True)
+        try:
+            with conn.cursor() as cur:
+                yield cur
+        finally:
+            conn.close()
 
-    def _ids(self) -> list[str]:
-        return sorted(_val(self.r.smembers(self.INDEX)) or [])
+    def _ensure_schema(self) -> None:
+        with self._cursor() as cur:
+            cur.execute(self.SCHEMA)
 
     def list(self) -> list[tuple[str, str, str]]:
-        out = []
-        for sheet_id in self._ids():
-            raw = _val(self.r.get(self._k(sheet_id)))
-            if raw is None:
-                continue
-            ts = _val(self.r.get(self._m(sheet_id))) or _now_iso()
-            out.append((sheet_id, raw, ts))
-        return out
+        with self._cursor() as cur:
+            cur.execute("SELECT id, body, updated_at FROM sheets ORDER BY id")
+            rows = cur.fetchall()
+        return [(r[0], r[1], _iso(r[2])) for r in rows]
 
     def read(self, sheet_id: str) -> tuple[str, str] | None:
-        raw = _val(self.r.get(self._k(sheet_id)))
-        if raw is None:
-            return None
-        ts = _val(self.r.get(self._m(sheet_id))) or _now_iso()
-        return (raw, ts)
+        with self._cursor() as cur:
+            cur.execute("SELECT body, updated_at FROM sheets WHERE id = %s", (sheet_id,))
+            r = cur.fetchone()
+        return None if not r else (r[0], _iso(r[1]))
 
     def write(self, sheet_id: str, raw: str) -> str:
-        ts = _now_iso()
-        self.r.set(self._k(sheet_id), raw)
-        self.r.set(self._m(sheet_id), ts)
-        self.r.sadd(self.INDEX, sheet_id)
-        return ts
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO sheets (id, body, updated_at) VALUES (%s, %s, now()) "
+                "ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body, updated_at = now() "
+                "RETURNING updated_at",
+                (sheet_id, raw),
+            )
+            r = cur.fetchone()
+        return _iso(r[0])
 
     def delete(self, sheet_id: str) -> bool:
-        existed = _val(self.r.get(self._k(sheet_id))) is not None
-        self.r.delete(self._k(sheet_id), self._m(sheet_id))
-        self.r.srem(self.INDEX, sheet_id)
-        return existed
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM sheets WHERE id = %s", (sheet_id,))
+            return cur.rowcount > 0
 
     def is_empty(self) -> bool:
-        return len(self._ids()) == 0
+        with self._cursor() as cur:
+            cur.execute("SELECT count(*) FROM sheets")
+            return cur.fetchone()[0] == 0
 
 
 def get_store() -> Store:
-    if os.environ.get("KV_REST_API_URL"):
-        store: Store = KVStore()
+    if os.environ.get("DATABASE_URL"):
+        store: Store = PostgresStore()
     else:
         root = Path(os.environ.get("SHEETS_DIR", HERE / "data" / "sheets"))
         store = FSStore(root)
-    # On Vercel *without* KV provisioned, FSStore points at the read-only
-    # function bundle — seeding would raise. Degrade to empty rather than
-    # crashing every cold start (the fix is to provision KV).
-    try:
-        store.seed_if_empty()
-    except Exception:
-        pass
+    store.setup()
     return store
