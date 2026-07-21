@@ -63,9 +63,18 @@ class FSStore(Store):
     def _path(self, sheet_id: str) -> Path:
         return self.root / f"{sheet_id}.md"
 
+    def _entries(self) -> list[Path]:
+        # Serve the data dir; fall back to the bundled seed when it's empty
+        # (e.g. a read-only serverless FS before KV is provisioned), so a fresh
+        # deploy still shows sheets instead of a blank page.
+        files = sorted(self.root.glob("*.md"))
+        if not files and SEED_DIR.is_dir():
+            files = sorted(SEED_DIR.glob("*.md"))
+        return files
+
     def list(self) -> list[tuple[str, str, str]]:
         out = []
-        for p in sorted(self.root.glob("*.md")):
+        for p in self._entries():
             raw = p.read_text(encoding="utf-8")
             ts = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat()
             out.append((p.stem, raw, ts))
@@ -73,6 +82,10 @@ class FSStore(Store):
 
     def read(self, sheet_id: str) -> tuple[str, str] | None:
         p = self._path(sheet_id)
+        if not p.is_file() and SEED_DIR.is_dir():
+            seeded = SEED_DIR / f"{sheet_id}.md"
+            if seeded.is_file():
+                p = seeded
         if not p.is_file():
             return None
         raw = p.read_text(encoding="utf-8")
@@ -92,7 +105,7 @@ class FSStore(Store):
         return True
 
     def is_empty(self) -> bool:
-        return not any(self.root.glob("*.md"))
+        return len(self._entries()) == 0
 
 
 def _val(resp):
