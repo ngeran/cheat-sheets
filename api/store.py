@@ -58,7 +58,12 @@ class Store(ABC):
 class FSStore(Store):
     def __init__(self, root: Path):
         self.root = root
-        self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Read-only filesystem (serverless without KV). Reads still work
+            # via the seed fallback in _entries(); writes will fail at call time.
+            pass
 
     def _path(self, sheet_id: str) -> Path:
         return self.root / f"{sheet_id}.md"
