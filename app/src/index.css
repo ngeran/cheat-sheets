@@ -1,3 +1,51 @@
 @import "tailwindcss";
-// app/src/main.tsx — add at the top:
-import "./index.css";
+
+@theme {
+  --color-background: #000000;
+  --color-surface: #000000;
+  --color-primary: #00dce5;      /* Obsidian Core teal */
+  --color-secondary: #f0883e;    /* orange accent */
+  --color-tertiary: #d2a8ff;     /* purple accent */
+  --color-on-background: #ffffff;
+  --color-on-surface-variant: #a1a1aa;
+
+  --font-body: "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+}
+
+body {
+  background-color: #000000;
+  color: #ffffff;
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* OLED rule: no solid highlight fills, ever. Active/selected states are
+   communicated with a border + glow, not a filled background. */
+.glass-card {
+  background: rgba(0, 220, 229, 0.03);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(0, 220, 229, 0.15);
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.glass-card:hover {
+  border-color: rgba(0, 220, 229, 0.5);
+  box-shadow: 0 0 24px rgba(0, 220, 229, 0.08);
+}
+
+.glow-primary {
+  filter: drop-shadow(0 0 6px rgba(0, 220, 229, 0.4));
+}
+
+::-webkit-scrollbar { height: 6px; width: 6px; }
+::-webkit-scrollbar-track { background: #000000; }
+::-webkit-scrollbar-thumb { background: var(--color-primary); border-radius: 0px; }
+
+input::placeholder { color: #52525b; }
+
+mark {
+  background: transparent;
+  color: var(--color-primary);
+  border-bottom: 1px solid rgba(0, 220, 229, 0.6);
+  padding: 0;
+}
