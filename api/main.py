@@ -28,7 +28,13 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from store import get_store
+from store import ReadOnlyStore, get_store
+
+# Returned when the store is read-only (serverless FS before KV is provisioned).
+READ_ONLY_MSG = (
+    "Storage is read-only. Provision Vercel KV (Project → Storage → Create → KV, "
+    "connect to all environments) and redeploy to create, edit, or delete sheets."
+)
 
 AccentColor = Literal["primary", "secondary", "tertiary"]
 
@@ -150,7 +156,10 @@ async def upload_sheet(file: UploadFile = File(...)):
     if store.read(sheet_id) is not None:  # dedup — don't clobber an existing sheet
         sheet_id = f"{sheet_id}-{uuid.uuid4().hex[:6]}"
 
-    ts = store.write(sheet_id, raw)
+    try:
+        ts = store.write(sheet_id, raw)
+    except ReadOnlyStore:
+        raise HTTPException(status_code=503, detail=READ_ONLY_MSG)
     return load_sheet(sheet_id, raw, ts)
 
 
@@ -159,11 +168,18 @@ def update_sheet(sheet_id: str, update: SheetUpdate):
     """Replace a sheet's markdown source verbatim."""
     if store.read(sheet_id) is None:
         raise HTTPException(status_code=404, detail="Sheet not found")
-    ts = store.write(sheet_id, update.body)
+    try:
+        ts = store.write(sheet_id, update.body)
+    except ReadOnlyStore:
+        raise HTTPException(status_code=503, detail=READ_ONLY_MSG)
     return load_sheet(sheet_id, update.body, ts)
 
 
 @app.delete("/api/sheets/{sheet_id}", status_code=204)
 def delete_sheet(sheet_id: str):
-    if not store.delete(sheet_id):
+    try:
+        deleted = store.delete(sheet_id)
+    except ReadOnlyStore:
+        raise HTTPException(status_code=503, detail=READ_ONLY_MSG)
+    if not deleted:
         raise HTTPException(status_code=404, detail="Sheet not found")

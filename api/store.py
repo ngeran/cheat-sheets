@@ -28,6 +28,11 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class ReadOnlyStore(Exception):
+    """Raised when the store can't persist — e.g. a serverless read-only FS
+    before Vercel KV is provisioned. Routes translate this into a clear 503."""
+
+
 class Store(ABC):
     @abstractmethod
     def list(self) -> list[tuple[str, str, str]]:
@@ -99,14 +104,20 @@ class FSStore(Store):
 
     def write(self, sheet_id: str, raw: str) -> str:
         p = self._path(sheet_id)
-        p.write_text(raw, encoding="utf-8")
+        try:
+            p.write_text(raw, encoding="utf-8")
+        except OSError as e:  # read-only filesystem (serverless without KV)
+            raise ReadOnlyStore() from e
         return datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat()
 
     def delete(self, sheet_id: str) -> bool:
         p = self._path(sheet_id)
         if not p.is_file():
             return False
-        p.unlink()
+        try:
+            p.unlink()
+        except OSError as e:  # read-only filesystem (serverless without KV)
+            raise ReadOnlyStore() from e
         return True
 
     def is_empty(self) -> bool:
