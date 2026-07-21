@@ -1,6 +1,9 @@
 """
-CORE_SHEETS API — serves markdown cheat sheets stored as files with YAML
-frontmatter under SHEETS_DIR (default ./data/sheets, /data/sheets in prod).
+CORE_SHEETS API — serves markdown cheat sheets.
+
+Storage is pluggable (see store.py): filesystem in dev, Vercel KV in prod.
+Routes are prefixed /api so Vercel can split /api/* (this function) from the
+SPA (everything else).
 
 Frontmatter shape:
 ---
@@ -11,14 +14,12 @@ color: primary            # primary | secondary | tertiary
 tags: [editor, cli]
 ---
 
-Body: ## headings each followed by a `| Command | Description |` table.
-See app/src/lib/parseSheet.ts for exactly how the frontend renders it.
+Body: ## headings each followed by a | Command | Description | table.
+See app/src/lib/parseSheet.ts for how the frontend renders it.
 """
 
-import os
 import re
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -27,30 +28,22 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-SHEETS_DIR = Path(os.environ.get("SHEETS_DIR", "data/sheets"))
-SHEETS_DIR.mkdir(parents=True, exist_ok=True)
-
-# On a fresh PVC, SHEETS_DIR starts empty. SEED_DIR ships inside the image
-# (built from api/data/sheets) so the app isn't blank on first deploy.
-SEED_DIR = Path(os.environ.get("SEED_DIR", "seed"))
-if SEED_DIR.is_dir() and not any(SHEETS_DIR.glob("*.md")):
-    for seed_file in SEED_DIR.glob("*.md"):
-        (SHEETS_DIR / seed_file.name).write_text(
-            seed_file.read_text(encoding="utf-8"), encoding="utf-8"
-        )
+from store import get_store
 
 AccentColor = Literal["primary", "secondary", "tertiary"]
 
 app = FastAPI(title="core-sheets-api")
 
-# Same-origin via nginx proxy in prod; permissive here so local dev works
-# even without the Vite proxy configured.
+# Same-origin in prod (Vercel rewrites /api/* to this function, served on the
+# same domain as the SPA). Permissive here so local dev works without a proxy.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+store = get_store()
 
 
 class SheetSummary(BaseModel):
@@ -114,10 +107,8 @@ def count_commands(body: str) -> int:
     return count
 
 
-def load_sheet(path: Path) -> SheetDetail:
-    raw = path.read_text(encoding="utf-8")
+def load_sheet(sheet_id: str, raw: str, updated_at: str) -> SheetDetail:
     meta, body = split_frontmatter(raw)
-    sheet_id = path.stem
     title = meta.get("title") or sheet_id.replace("-", " ").title()
     return SheetDetail(
         id=sheet_id,
@@ -127,23 +118,23 @@ def load_sheet(path: Path) -> SheetDetail:
         color=meta.get("color", "primary"),
         tags=meta.get("tags", []),
         command_count=count_commands(body),
-        updated_at=datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
+        updated_at=updated_at,
         body=body,
     )
 
 
 @app.get("/api/sheets", response_model=list[SheetSummary])
 def list_sheets():
-    sheets = [load_sheet(p) for p in sorted(SHEETS_DIR.glob("*.md"))]
+    sheets = [load_sheet(i, raw, ts) for (i, raw, ts) in store.list()]
     return sorted(sheets, key=lambda s: s.title.lower())
 
 
 @app.get("/api/sheets/{sheet_id}", response_model=SheetDetail)
 def get_sheet(sheet_id: str):
-    path = SHEETS_DIR / f"{sheet_id}.md"
-    if not path.is_file():
+    got = store.read(sheet_id)
+    if not got:
         raise HTTPException(status_code=404, detail="Sheet not found")
-    return load_sheet(path)
+    return load_sheet(sheet_id, *got)
 
 
 @app.post("/api/sheets", response_model=SheetSummary)
@@ -156,41 +147,23 @@ async def upload_sheet(file: UploadFile = File(...)):
 
     title = meta.get("title") or Path(file.filename).stem.replace("-", " ").title()
     sheet_id = slugify(Path(file.filename).stem)
-
-    path = SHEETS_DIR / f"{sheet_id}.md"
-    if path.exists():
+    if store.read(sheet_id) is not None:  # dedup — don't clobber an existing sheet
         sheet_id = f"{sheet_id}-{uuid.uuid4().hex[:6]}"
-        path = SHEETS_DIR / f"{sheet_id}.md"
 
-    frontmatter = yaml.safe_dump(
-        {
-            "title": title,
-            "subtitle": meta.get("subtitle", ""),
-            "icon": meta.get("icon", "Terminal"),
-            "color": meta.get("color", "primary"),
-            "tags": meta.get("tags", []),
-        },
-        sort_keys=False,
-    )
-    path.write_text(f"---\n{frontmatter}---\n\n{body}", encoding="utf-8")
-
-    return load_sheet(path)
+    ts = store.write(sheet_id, raw)
+    return load_sheet(sheet_id, raw, ts)
 
 
 @app.put("/api/sheets/{sheet_id}", response_model=SheetDetail)
 def update_sheet(sheet_id: str, update: SheetUpdate):
-    """Replace a sheet's markdown source verbatim. Frontmatter is re-parsed
-    on read (load_sheet), so what's written is exactly what's stored."""
-    path = SHEETS_DIR / f"{sheet_id}.md"
-    if not path.is_file():
+    """Replace a sheet's markdown source verbatim."""
+    if store.read(sheet_id) is None:
         raise HTTPException(status_code=404, detail="Sheet not found")
-    path.write_text(update.body, encoding="utf-8")
-    return load_sheet(path)
+    ts = store.write(sheet_id, update.body)
+    return load_sheet(sheet_id, update.body, ts)
 
 
 @app.delete("/api/sheets/{sheet_id}", status_code=204)
 def delete_sheet(sheet_id: str):
-    path = SHEETS_DIR / f"{sheet_id}.md"
-    if not path.is_file():
+    if not store.delete(sheet_id):
         raise HTTPException(status_code=404, detail="Sheet not found")
-    path.unlink()
